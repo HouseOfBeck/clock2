@@ -6,6 +6,7 @@
 #include "ethernet.h"
 #include "gps_uart.h"
 #include "mdns_service.h"
+#include "ntp_server.h"
 #include "pps.h"
 #include "timebase.h"
 
@@ -17,6 +18,7 @@ void app_main(void)
     ESP_ERROR_CHECK(pps_start());
     ESP_ERROR_CHECK(ethernet_start());
     ESP_ERROR_CHECK(clock2_mdns_start());
+    ntp_server_start();
 
     ESP_LOGI(TAG, "Clock 2 GPS, PPS, Ethernet, and mDNS hardware test");
 

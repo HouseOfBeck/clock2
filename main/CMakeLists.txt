@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "gps_uart.c"
         "nmea_timing.c"
+        "ntp_server.c"
         "pps.c"
         "timebase.c"
         "ethernet.c"
@@ -17,5 +18,6 @@ idf_component_register(
         esp_event
         esp_netif
         esp_timer
+        lwip
         mdns
 )
