@@ -33,6 +33,7 @@
 #define NTP_PRECISION_EXPONENT      (-20)
 
 #define NTP_LEAP_NO_WARNING         0
+#define NTP_VERSION_3               3
 #define NTP_VERSION_4               4
 #define NTP_MODE_CLIENT             3
 #define NTP_MODE_SERVER             4
@@ -70,7 +71,6 @@ _Static_assert(sizeof(ntp_packet_t) == NTP_PACKET_SIZE,
 static const char *TAG = "clock2-ntp";
 
 static struct udp_pcb *ntp_pcb;
-static struct pbuf *ntp_reply_pbuf;
 static portMUX_TYPE stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static ntp_server_stats_t stats;
 
@@ -183,9 +183,9 @@ static void ntp_receive_callback(
 
     stats_record_received();
 
-    ntp_packet_t request;
+    ntp_packet_t request = {0};
     const bool packet_size_valid =
-        request_pbuf->tot_len == NTP_PACKET_SIZE;
+        request_pbuf->tot_len >= NTP_PACKET_SIZE;
     const uint16_t copied = packet_size_valid
                                 ? pbuf_copy_partial(
                                       request_pbuf,
@@ -195,8 +195,12 @@ static void ntp_receive_callback(
                                 : 0;
     pbuf_free(request_pbuf);
 
+    const uint8_t client_version =
+        (request.leap_version_mode >> 3) & 0x07U;
     if (copied != sizeof(request) ||
-        (request.leap_version_mode & 0x07U) != NTP_MODE_CLIENT) {
+        (request.leap_version_mode & 0x07U) != NTP_MODE_CLIENT ||
+        (client_version != NTP_VERSION_3 &&
+         client_version != NTP_VERSION_4)) {
         stats_record_ignored(false);
         return;
     }
@@ -220,21 +224,50 @@ static void ntp_receive_callback(
         return;
     }
 
+    /*
+     * Allocate one response pbuf per request. The lwIP transmit path prepends
+     * protocol headers in the pbuf's reserved headroom and can leave its
+     * len/tot_len changed, so a pbuf must not be reused for another reply.
+     */
+    struct pbuf *response_pbuf = pbuf_alloc(
+        PBUF_TRANSPORT,
+        NTP_PACKET_SIZE,
+        PBUF_RAM);
+    if (response_pbuf == NULL) {
+        stats_record_ignored(false);
+        return;
+    }
+
     /* Generate transmit and reference timestamps immediately before send. */
     if (!get_current_ntp_time(
             &reply.transmit_timestamp,
             &reply.reference_timestamp)) {
+        pbuf_free(response_pbuf);
         stats_record_ignored(true);
         return;
     }
 
-    memcpy(ntp_reply_pbuf->payload, &reply, sizeof(reply));
+    memcpy(response_pbuf->payload, &reply, sizeof(reply));
+
+    if (response_pbuf->len != NTP_PACKET_SIZE ||
+        response_pbuf->tot_len != NTP_PACKET_SIZE) {
+        pbuf_free(response_pbuf);
+        stats_record_ignored(false);
+        return;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "NTP TX pbuf len=%u tot_len=%u",
+        (unsigned)response_pbuf->len,
+        (unsigned)response_pbuf->tot_len);
 
     const err_t send_result = udp_sendto(
         pcb,
-        ntp_reply_pbuf,
+        response_pbuf,
         client_address,
         client_port);
+    pbuf_free(response_pbuf);
 
     if (send_result != ERR_OK) {
         stats_record_ignored(false);
@@ -272,21 +305,9 @@ static esp_err_t ntp_server_init_in_tcpip(void *context)
         return ESP_ERR_NO_MEM;
     }
 
-    ntp_reply_pbuf = pbuf_alloc(
-        PBUF_TRANSPORT,
-        NTP_PACKET_SIZE,
-        PBUF_RAM);
-    if (ntp_reply_pbuf == NULL) {
-        udp_remove(ntp_pcb);
-        ntp_pcb = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-
     const err_t bind_result =
         udp_bind(ntp_pcb, IP4_ADDR_ANY, NTP_SERVER_PORT);
     if (bind_result != ERR_OK) {
-        pbuf_free(ntp_reply_pbuf);
-        ntp_reply_pbuf = NULL;
         udp_remove(ntp_pcb);
         ntp_pcb = NULL;
         return ESP_FAIL;
