@@ -8,6 +8,8 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 
+#include "pps_diagnostics.h"
+
 #define GPS_PPS_GPIO 43
 
 static const char *TAG = "clock2-gps";
@@ -17,20 +19,43 @@ static portMUX_TYPE pps_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t pps_count;
 static volatile int64_t pps_timestamp_us;
 static volatile int64_t pps_previous_us;
+static volatile uint32_t pps_isr_sequence;
 
 static void IRAM_ATTR pps_isr_handler(void *arg)
 {
+    /* First executable operation: capture the software ISR timestamp. */
+    const int64_t isr_timestamp_us = esp_timer_get_time();
     (void)arg;
-
-    const int64_t now_us = esp_timer_get_time();
+    /*
+     * ESP-IDF's per-pin service clears edge-triggered status before invoking
+     * this handler, so no truthful interrupt-status value remains here.
+     * The sampled level and ISR sequence are retained instead.
+     */
+    const int gpio_level = gpio_get_level(GPS_PPS_GPIO);
+    int64_t store_delay_us = 0;
+    uint32_t isr_sequence;
 
     portENTER_CRITICAL_ISR(&pps_lock);
 
-    pps_previous_us = pps_timestamp_us;
-    pps_timestamp_us = now_us;
-    pps_count++;
+    isr_sequence = ++pps_isr_sequence;
+    if (gpio_level != 0) {
+        /*
+         * The measured write latency does not alter the captured value:
+         * pps_timestamp_us remains the ISR-entry timestamp above.
+         */
+        store_delay_us = esp_timer_get_time() - isr_timestamp_us;
+        pps_previous_us = pps_timestamp_us;
+        pps_timestamp_us = isr_timestamp_us;
+        pps_count++;
+    }
 
     portEXIT_CRITICAL_ISR(&pps_lock);
+
+    pps_diagnostics_record_edge_from_isr(
+        isr_timestamp_us,
+        gpio_level,
+        isr_sequence,
+        store_delay_us);
 }
 
 esp_err_t pps_start(void)
@@ -40,13 +65,29 @@ esp_err_t pps_start(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
+#if PPS_PATH_DIAGNOSTICS
+        /* Falling edges are diagnostic only; rising remains authoritative. */
+        .intr_type = GPIO_INTR_ANYEDGE,
+#else
         .intr_type = GPIO_INTR_POSEDGE,
+#endif
     };
 
     ESP_RETURN_ON_ERROR(
         gpio_config(&pps_config),
         TAG,
         "PPS GPIO configuration failed");
+
+#if PPS_PATH_DIAGNOSTICS
+    const esp_err_t diagnostic_result =
+        pps_diagnostics_start(GPS_PPS_GPIO);
+    if (diagnostic_result != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "PPS hardware capture unavailable: %s",
+            esp_err_to_name(diagnostic_result));
+    }
+#endif
 
     ESP_RETURN_ON_ERROR(
         gpio_install_isr_service(0),
@@ -94,6 +135,8 @@ void pps_log_latest(void)
     previous_timestamp = pps_previous_us;
 
     portEXIT_CRITICAL(&pps_lock);
+
+    pps_diagnostics_log_latest();
 
     if (current_count == displayed_pps_count) {
         return;

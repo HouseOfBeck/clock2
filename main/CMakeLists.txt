@@ -5,6 +5,8 @@ idf_component_register(
         "nmea_timing.c"
         "ntp_path_diagnostics.c"
         "ntp_server.c"
+        "ntp_time.c"
+        "pps_diagnostics.c"
         "pps.c"
         "timebase.c"
         "ethernet.c"
@@ -13,6 +15,7 @@ idf_component_register(
         "."
     REQUIRES
         esp_driver_gpio
+        esp_driver_mcpwm
         esp_driver_spi
         esp_driver_uart
         esp_eth

@@ -16,11 +16,11 @@
 #include "lwip/udp.h"
 
 #include "ntp_path_diagnostics.h"
+#include "ntp_time.h"
 #include "timebase.h"
 
 #define NTP_SERVER_PORT             123
 #define NTP_PACKET_SIZE             48
-#define NTP_UNIX_EPOCH_OFFSET       2208988800ULL
 #define NTP_REFERENCE_ID            0x47505300  /* "GPS\0" */
 /* NTP short format (16.16): 66 / 65536 seconds is approximately 1 ms. */
 #define NTP_ROOT_DISPERSION         66U
@@ -75,6 +75,19 @@ static struct udp_pcb *ntp_pcb;
 static portMUX_TYPE stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static ntp_server_stats_t stats;
 
+#if NTP_PATH_DIAGNOSTICS
+typedef struct {
+    uint32_t pps_count;
+    int64_t utc_second;
+    int64_t pps_timestamp_us;
+    int64_t now_us;
+    int64_t delta_us;
+    int64_t unix_us;
+    uint32_t ntp_seconds;
+    uint32_t ntp_fraction;
+} ntp_timecheck_t;
+#endif
+
 static void stats_record_received(void)
 {
     portENTER_CRITICAL(&stats_lock);
@@ -122,24 +135,22 @@ void ntp_server_log_stats(void)
         snapshot.invalid_timebase_requests);
 }
 
-static void unix_time_to_ntp(
-    int64_t unix_seconds,
-    int64_t microseconds,
+static void ntp_value_to_network_timestamp(
+    const ntp_time_value_t *value,
     ntp_timestamp_t *timestamp)
 {
-    const uint32_t ntp_seconds =
-        (uint32_t)((uint64_t)unix_seconds + NTP_UNIX_EPOCH_OFFSET);
-    const uint32_t ntp_fraction =
-        (uint32_t)(((uint64_t)microseconds << 32) / 1000000ULL);
-
-    timestamp->seconds = lwip_htonl(ntp_seconds);
-    timestamp->fraction = lwip_htonl(ntp_fraction);
+    timestamp->seconds = lwip_htonl(value->ntp_seconds);
+    timestamp->fraction = lwip_htonl(value->ntp_fraction);
 }
 
 static bool get_current_ntp_time(
     ntp_timestamp_t *current_timestamp,
     ntp_timestamp_t *reference_timestamp,
-    int64_t *sample_timestamp_us)
+    int64_t *sample_timestamp_us
+#if NTP_PATH_DIAGNOSTICS
+    , ntp_timecheck_t *timecheck
+#endif
+    )
 {
     timebase_snapshot_t snapshot;
     if (!timebase_get_snapshot(&snapshot) || !snapshot.valid) {
@@ -147,23 +158,25 @@ static bool get_current_ntp_time(
     }
 
     const int64_t now_us = esp_timer_get_time();
-    const int64_t delta_us = now_us - snapshot.pps_timestamp_us;
-    if (delta_us < 0) {
+    ntp_time_value_t current_value;
+    if (!ntp_time_from_pps(
+            snapshot.unix_seconds,
+            snapshot.pps_timestamp_us,
+            now_us,
+            &current_value)) {
         return false;
     }
 
-    const int64_t elapsed_seconds = delta_us / 1000000;
-    const int64_t remaining_us = delta_us % 1000000;
-
-    unix_time_to_ntp(
-        snapshot.unix_seconds + elapsed_seconds,
-        remaining_us,
-        current_timestamp);
+    ntp_value_to_network_timestamp(&current_value, current_timestamp);
 
     if (reference_timestamp != NULL) {
-        unix_time_to_ntp(
-            snapshot.unix_seconds,
-            0,
+        ntp_time_value_t reference_value;
+        if (!ntp_time_from_unix(
+                snapshot.unix_seconds, 0, &reference_value)) {
+            return false;
+        }
+        ntp_value_to_network_timestamp(
+            &reference_value,
             reference_timestamp);
     }
 
@@ -171,8 +184,46 @@ static bool get_current_ntp_time(
         *sample_timestamp_us = now_us;
     }
 
+#if NTP_PATH_DIAGNOSTICS
+    if (timecheck != NULL) {
+        *timecheck = (ntp_timecheck_t) {
+            .pps_count = snapshot.pps_count,
+            .utc_second = snapshot.unix_seconds,
+            .pps_timestamp_us = snapshot.pps_timestamp_us,
+            .now_us = now_us,
+            .delta_us = now_us - snapshot.pps_timestamp_us,
+            .unix_us = current_value.unix_seconds * 1000000LL +
+                       current_value.microseconds,
+            .ntp_seconds = current_value.ntp_seconds,
+            .ntp_fraction = current_value.ntp_fraction,
+        };
+    }
+#endif
+
     return true;
 }
+
+#if NTP_PATH_DIAGNOSTICS
+static void log_timecheck(const char *kind, const ntp_timecheck_t *check)
+{
+    ESP_LOGI(
+        TAG,
+        "NTP timecheck kind=%s pps_count=%" PRIu32
+        " utc_second=%" PRId64 " pps_timestamp_us=%" PRId64
+        " now_us=%" PRId64 " delta_us=%" PRId64
+        " unix_us=%" PRId64 " ntp_seconds=%" PRIu32
+        " ntp_fraction=0x%08" PRIx32,
+        kind,
+        check->pps_count,
+        check->utc_second,
+        check->pps_timestamp_us,
+        check->now_us,
+        check->delta_us,
+        check->unix_us,
+        check->ntp_seconds,
+        check->ntp_fraction);
+}
+#endif
 
 static void ntp_receive_callback(
     void *arg,
@@ -237,10 +288,17 @@ static void ntp_receive_callback(
     };
 
     int64_t receive_timestamp_sample_us = 0;
+#if NTP_PATH_DIAGNOSTICS
+    ntp_timecheck_t receive_timecheck;
+#endif
     if (!get_current_ntp_time(
             &reply.receive_timestamp,
             NULL,
-            &receive_timestamp_sample_us)) {
+            &receive_timestamp_sample_us
+#if NTP_PATH_DIAGNOSTICS
+            , &receive_timecheck
+#endif
+            )) {
         stats_record_ignored(true);
         return;
     }
@@ -262,12 +320,14 @@ static void ntp_receive_callback(
     /* Generate transmit and reference timestamps immediately before send. */
 #if NTP_PATH_DIAGNOSTICS
     int64_t transmit_timestamp_sample_us = 0;
+    ntp_timecheck_t transmit_timecheck;
 #endif
     if (!get_current_ntp_time(
             &reply.transmit_timestamp,
             &reply.reference_timestamp,
 #if NTP_PATH_DIAGNOSTICS
-            &transmit_timestamp_sample_us)) {
+            &transmit_timestamp_sample_us,
+            &transmit_timecheck)) {
 #else
             NULL)) {
 #endif
@@ -304,6 +364,8 @@ static void ntp_receive_callback(
     pbuf_free(response_pbuf);
 
 #if NTP_PATH_DIAGNOSTICS
+    log_timecheck("receive", &receive_timecheck);
+    log_timecheck("transmit", &transmit_timecheck);
     ntp_path_diagnostics_log_request(
         &path_snapshot,
         callback_entry_us,
@@ -367,6 +429,11 @@ static esp_err_t ntp_server_init_in_tcpip(void *context)
 
 void ntp_server_start(void)
 {
+#if NTP_PATH_DIAGNOSTICS
+    ESP_ERROR_CHECK(ntp_time_run_self_tests() ? ESP_OK : ESP_FAIL);
+    ESP_LOGI(TAG, "NTP time self-tests passed");
+#endif
+
     ESP_ERROR_CHECK(esp_netif_tcpip_exec(
         ntp_server_init_in_tcpip,
         NULL));

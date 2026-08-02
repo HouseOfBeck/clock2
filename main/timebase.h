@@ -15,9 +15,11 @@ typedef struct {
 
 typedef struct {
     bool valid;
+    /* At pps_timestamp_us, UTC is exactly unix_seconds.000000. */
     int64_t unix_seconds;
     uint32_t pps_count;
     int64_t pps_timestamp_us;
+    /* Monotonic age of that latest PPS edge when this snapshot was made. */
     int64_t age_us;
     char source[4];
 } timebase_snapshot_t;

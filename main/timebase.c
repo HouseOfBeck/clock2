@@ -444,6 +444,11 @@ bool timebase_get_snapshot(timebase_snapshot_t *snapshot)
     }
 
     snapshot->valid = true;
+    /*
+     * The anchor is advanced by the unsigned PPS-count delta, while the
+     * timestamp comes from that same latest PPS snapshot. Therefore:
+     * At pps_timestamp_us, UTC is exactly unix_seconds.000000.
+     */
     snapshot->unix_seconds =
         current.anchor_unix_seconds + (int64_t)pps_delta;
     snapshot->pps_count = pps.count;
@@ -530,6 +535,10 @@ void timebase_process_sentence(
     }
 
     int64_t association_delay_us;
+    /*
+     * The UART-derived timestamp is only a plausibility gate. It is never
+     * used as the UTC boundary; the actual PPS ISR snapshot below is.
+     */
     if (!timebase_association_delay_valid(
             estimated_arrival_us,
             pps.timestamp_us,
@@ -586,6 +595,10 @@ void timebase_process_sentence(
                 TIMEBASE_ZDA_PREFERENCE_US;
 
         if (!keep_recent_zda_anchor) {
+            /*
+             * L76K RMC/ZDA labels the most recent PPS. At the stored
+             * pps_timestamp_us, anchor_unix_seconds is exactly .000000.
+             */
             state.anchor_unix_seconds = candidate_unix_seconds;
             state.anchor_pps_count = pps.count;
             state.anchor_pps_timestamp_us = pps.timestamp_us;
