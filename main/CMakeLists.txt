@@ -4,6 +4,7 @@ idf_component_register(
         "gps_uart.c"
         "nmea_timing.c"
         "pps.c"
+        "timebase.c"
         "ethernet.c"
         "mdns_service.c"
     INCLUDE_DIRS

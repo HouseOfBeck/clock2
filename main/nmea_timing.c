@@ -7,6 +7,7 @@
 #include "esp_log.h"
 
 #include "pps.h"
+#include "timebase.h"
 
 #define NMEA_LINE_BUFFER_SIZE       128
 #define NMEA_UTC_BUFFER_SIZE        24
@@ -179,33 +180,34 @@ static void process_line(int64_t estimated_arrival_us)
             "NMEA %s utc=%s pps=none estimated_delay=unavailable",
             sentence_type_name(type),
             utc);
-        return;
+    } else {
+        const int64_t delay_us =
+            estimated_arrival_us - pps.timestamp_us;
+
+        if (delay_us < 0 || delay_us > NMEA_MAX_VALID_DELAY_US) {
+            ESP_LOGW(
+                TAG,
+                "NMEA %s utc=%s pps=%" PRIu32
+                " estimated_delay=%" PRId64 " us invalid",
+                sentence_type_name(type),
+                utc,
+                pps.count,
+                delay_us);
+        } else {
+            ESP_LOGI(
+                TAG,
+                "NMEA %s utc=%s pps=%" PRIu32
+                " estimated_delay=%" PRId64 " us",
+                sentence_type_name(type),
+                utc,
+                pps.count,
+                delay_us);
+
+            record_valid_sample(type, delay_us);
+        }
     }
 
-    const int64_t delay_us = estimated_arrival_us - pps.timestamp_us;
-
-    if (delay_us < 0 || delay_us > NMEA_MAX_VALID_DELAY_US) {
-        ESP_LOGW(
-            TAG,
-            "NMEA %s utc=%s pps=%" PRIu32
-            " estimated_delay=%" PRId64 " us invalid",
-            sentence_type_name(type),
-            utc,
-            pps.count,
-            delay_us);
-        return;
-    }
-
-    ESP_LOGI(
-        TAG,
-        "NMEA %s utc=%s pps=%" PRIu32
-        " estimated_delay=%" PRId64 " us",
-        sentence_type_name(type),
-        utc,
-        pps.count,
-        delay_us);
-
-    record_valid_sample(type, delay_us);
+    timebase_process_sentence(line_buffer, estimated_arrival_us);
 }
 
 static bool complete_line(int64_t estimated_arrival_us)

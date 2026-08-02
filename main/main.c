@@ -7,6 +7,7 @@
 #include "gps_uart.h"
 #include "mdns_service.h"
 #include "pps.h"
+#include "timebase.h"
 
 static const char *TAG = "clock2-gps";
 
@@ -20,7 +21,9 @@ void app_main(void)
     ESP_LOGI(TAG, "Clock 2 GPS, PPS, Ethernet, and mDNS hardware test");
 
     while (true) {
+        timebase_poll();
         gps_uart_poll();
         pps_log_latest();
+        timebase_log_demo();
     }
 }
