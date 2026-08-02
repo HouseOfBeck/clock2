@@ -18,9 +18,9 @@
 #include "esp_idf_version.h"
 #include "lwip/ip4_addr.h"
 
+#include "app_config.h"
 #include "ethernet.h"
 #include "gps_uart.h"
-#include "mdns_service.h"
 #include "nmea_timing.h"
 #include "ntp_path_diagnostics.h"
 #include "ntp_server.h"
@@ -34,6 +34,9 @@
 #define WEB_SERVER_STACK_SIZE 6144
 #define WEB_SERVER_MAX_OPEN_SOCKETS 5
 #define WEB_FORMAT_BUFFER_SIZE 512
+#define SETTINGS_REQUEST_BODY_MAX 96
+#define SETTINGS_HOSTNAME_INPUT_SIZE (APP_HOSTNAME_BUFFER_SIZE + 1)
+#define RESTART_DELAY_US 1000000
 #define SEND_LITERAL(request, literal) \
     httpd_resp_send_chunk((request), (literal), sizeof(literal) - 1U)
 
@@ -50,6 +53,7 @@ typedef struct {
 
 static const char *TAG = "clock2-web";
 static httpd_handle_t server;
+static esp_timer_handle_t restart_timer;
 static web_system_info_t system_info;
 
 static const char *reset_reason_name(esp_reset_reason_t reason)
@@ -203,9 +207,22 @@ static esp_err_t status_page_handler(httpd_req_t *request)
     return html_handler(request, clock2_status_html);
 }
 
-static esp_err_t advanced_page_handler(httpd_req_t *request)
+static esp_err_t diagnostics_page_handler(httpd_req_t *request)
 {
-    return html_handler(request, clock2_advanced_html);
+    return html_handler(request, clock2_diagnostics_html);
+}
+
+static esp_err_t settings_page_handler(httpd_req_t *request)
+{
+    return html_handler(request, clock2_settings_html);
+}
+
+static esp_err_t advanced_redirect_handler(httpd_req_t *request)
+{
+    httpd_resp_set_status(request, "302 Found");
+    httpd_resp_set_hdr(request, "Location", "/diagnostics");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_send(request, NULL, 0);
 }
 
 static esp_err_t send_timing_json(
@@ -232,6 +249,7 @@ static esp_err_t status_json_handler(httpd_req_t *request)
     timebase_config_snapshot_t timebase_config;
     ntp_server_snapshot_t ntp;
     gps_uart_config_snapshot_t uart;
+    app_config_snapshot_t app_config;
 
     (void)ethernet_get_snapshot(&ethernet);
     nmea_timing_get_snapshot(&gps);
@@ -241,6 +259,7 @@ static esp_err_t status_json_handler(httpd_req_t *request)
     timebase_get_config_snapshot(&timebase_config);
     ntp_server_get_snapshot(&ntp);
     gps_uart_get_config_snapshot(&uart);
+    app_config_get_snapshot(&app_config);
 
     char utc[24] = "";
     if (timebase.valid) {
@@ -251,10 +270,14 @@ static esp_err_t status_json_handler(httpd_req_t *request)
     char netmask[16];
     char gateway[16];
     char mac[18];
+    char active_hostname[APP_HOSTNAME_BUFFER_SIZE + sizeof(".local")];
+    char configured_hostname[APP_HOSTNAME_BUFFER_SIZE + sizeof(".local")];
     format_ipv4(ethernet.ipv4, ethernet.has_ipv4, ip);
     format_ipv4(ethernet.netmask, ethernet.has_ipv4, netmask);
     format_ipv4(ethernet.gateway, ethernet.has_ipv4, gateway);
     format_mac(ethernet.mac, mac);
+    snprintf(active_hostname, sizeof(active_hostname), "%s.local", app_config.active_hostname);
+    snprintf(configured_hostname, sizeof(configured_hostname), "%s.local", app_config.configured_hostname);
 
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
@@ -322,10 +345,15 @@ static esp_err_t status_json_handler(httpd_req_t *request)
 
     ESP_RETURN_ON_ERROR(send_chunkf(
         request,
-        "\"network\":{\"running\":%s,\"link\":%s,\"hostname\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\",\"netmask\":\"%s\",\"gateway\":\"%s\"},",
+        "\"network\":{\"running\":%s,\"link\":%s,\"hostname\":\"%s\",\"hostname_label\":\"%s\",\"configured_hostname_label\":\"%s\",\"configured_hostname\":\"%s\",\"hostname_restart_pending\":%s,\"ip\":\"%s\",\"mac\":\"%s\",\"netmask\":\"%s\",\"gateway\":\"%s\"},",
         ethernet.running ? "true" : "false",
         ethernet.link_up ? "true" : "false",
-        clock2_mdns_hostname(), ip, mac, netmask, gateway), TAG, "Network JSON failed");
+        active_hostname,
+        app_config.active_hostname,
+        app_config.configured_hostname,
+        configured_hostname,
+        app_config.hostname_restart_pending ? "true" : "false",
+        ip, mac, netmask, gateway), TAG, "Network JSON failed");
 
     ESP_RETURN_ON_ERROR(send_chunkf(
         request,
@@ -409,6 +437,252 @@ static esp_err_t status_json_handler(httpd_req_t *request)
     return httpd_resp_send_chunk(request, NULL, 0);
 }
 
+static const char *skip_json_space(const char *cursor)
+{
+    while (*cursor == ' ' || *cursor == '\t' ||
+           *cursor == '\r' || *cursor == '\n') {
+        cursor++;
+    }
+    return cursor;
+}
+
+static bool parse_bounded_json_string(
+    const char **cursor,
+    char *output,
+    size_t output_size)
+{
+    const char *position = *cursor;
+    if (*position != '\"' || output_size == 0) {
+        return false;
+    }
+    position++;
+
+    size_t used = 0;
+    while (*position != '\0' && *position != '\"') {
+        unsigned char character = (unsigned char)*position++;
+        if (character < 0x20U || character == '\\') {
+            return false;
+        }
+        if (used + 1 >= output_size) {
+            return false;
+        }
+        output[used++] = (char)character;
+    }
+    if (*position != '\"') {
+        return false;
+    }
+    position++;
+    output[used] = '\0';
+    *cursor = position;
+    return true;
+}
+
+static bool parse_hostname_request(
+    const char *body,
+    char hostname[SETTINGS_HOSTNAME_INPUT_SIZE])
+{
+    char key[16];
+    const char *cursor = skip_json_space(body);
+    if (*cursor != '{') {
+        return false;
+    }
+    cursor++;
+    cursor = skip_json_space(cursor);
+    if (!parse_bounded_json_string(&cursor, key, sizeof(key)) ||
+        strcmp(key, "hostname") != 0) {
+        return false;
+    }
+    cursor = skip_json_space(cursor);
+    if (*cursor != ':') {
+        return false;
+    }
+    cursor++;
+    cursor = skip_json_space(cursor);
+    if (!parse_bounded_json_string(
+            &cursor, hostname, SETTINGS_HOSTNAME_INPUT_SIZE)) {
+        return false;
+    }
+    cursor = skip_json_space(cursor);
+    if (*cursor != '}') {
+        return false;
+    }
+    cursor++;
+    return *skip_json_space(cursor) == '\0';
+}
+
+static esp_err_t send_json_error(
+    httpd_req_t *request,
+    const char *status,
+    const char *message)
+{
+    httpd_resp_set_status(request, status);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    ESP_RETURN_ON_ERROR(
+        SEND_LITERAL(request, "{\"ok\":false,\"error\":"),
+        TAG,
+        "JSON error prefix failed");
+    ESP_RETURN_ON_ERROR(
+        send_json_string(request, message), TAG, "JSON error text failed");
+    ESP_RETURN_ON_ERROR(
+        SEND_LITERAL(request, "}"), TAG, "JSON error close failed");
+    return httpd_resp_send_chunk(request, NULL, 0);
+}
+
+static esp_err_t send_hostname_result(
+    httpd_req_t *request,
+    const app_config_snapshot_t *config)
+{
+    char configured_url[APP_HOSTNAME_BUFFER_SIZE + sizeof("http://.local/")];
+    char active_url[APP_HOSTNAME_BUFFER_SIZE + sizeof("http://.local/")];
+    snprintf(configured_url, sizeof(configured_url),
+             "http://%s.local/", config->configured_hostname);
+    snprintf(active_url, sizeof(active_url),
+             "http://%s.local/", config->active_hostname);
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    ESP_RETURN_ON_ERROR(
+        SEND_LITERAL(request, "{\"ok\":true,\"configured_hostname\":"),
+        TAG,
+        "Settings JSON prefix failed");
+    ESP_RETURN_ON_ERROR(send_json_string(request, config->configured_hostname),
+                        TAG, "Configured hostname failed");
+    ESP_RETURN_ON_ERROR(SEND_LITERAL(request, ",\"configured_url\":"),
+                        TAG, "Configured URL key failed");
+    ESP_RETURN_ON_ERROR(send_json_string(request, configured_url),
+                        TAG, "Configured URL failed");
+    ESP_RETURN_ON_ERROR(SEND_LITERAL(request, ",\"active_hostname\":"),
+                        TAG, "Active hostname key failed");
+    ESP_RETURN_ON_ERROR(send_json_string(request, config->active_hostname),
+                        TAG, "Active hostname failed");
+    ESP_RETURN_ON_ERROR(SEND_LITERAL(request, ",\"active_url\":"),
+                        TAG, "Active URL key failed");
+    ESP_RETURN_ON_ERROR(send_json_string(request, active_url),
+                        TAG, "Active URL failed");
+    ESP_RETURN_ON_ERROR(send_chunkf(
+        request,
+        ",\"restart_required\":%s}",
+        config->hostname_restart_pending ? "true" : "false"),
+        TAG,
+        "Restart state failed");
+    return httpd_resp_send_chunk(request, NULL, 0);
+}
+
+static bool content_type_is_json(httpd_req_t *request)
+{
+    char content_type[32];
+    if (httpd_req_get_hdr_value_str(
+            request, "Content-Type", content_type, sizeof(content_type)) != ESP_OK) {
+        return false;
+    }
+    return strcmp(content_type, "application/json") == 0;
+}
+
+static esp_err_t settings_hostname_handler(httpd_req_t *request)
+{
+    if (!content_type_is_json(request)) {
+        return send_json_error(
+            request, "415 Unsupported Media Type", "Content-Type must be application/json.");
+    }
+    if (request->content_len == 0 ||
+        request->content_len > SETTINGS_REQUEST_BODY_MAX) {
+        return send_json_error(
+            request,
+            request->content_len == 0 ? "400 Bad Request" : "413 Payload Too Large",
+            request->content_len == 0 ? "Request body is required." : "Request body is too large.");
+    }
+
+    char body[SETTINGS_REQUEST_BODY_MAX + 1];
+    size_t received = 0;
+    while (received < request->content_len) {
+        const int result = httpd_req_recv(
+            request,
+            body + received,
+            request->content_len - received);
+        if (result <= 0) {
+            return send_json_error(
+                request, "400 Bad Request", "Unable to read request body.");
+        }
+        received += (size_t)result;
+    }
+    body[received] = '\0';
+
+    char hostname[SETTINGS_HOSTNAME_INPUT_SIZE];
+    if (!parse_hostname_request(body, hostname)) {
+        return send_json_error(
+            request, "400 Bad Request", "Malformed JSON or missing hostname.");
+    }
+
+    char normalized[APP_HOSTNAME_BUFFER_SIZE];
+    char validation_error[96];
+    if (app_config_validate_hostname(
+            hostname,
+            normalized,
+            sizeof(normalized),
+            validation_error,
+            sizeof(validation_error)) != ESP_OK) {
+        return send_json_error(request, "400 Bad Request", validation_error);
+    }
+    if (app_config_save_hostname(normalized) != ESP_OK) {
+        return send_json_error(
+            request, "500 Internal Server Error", "Unable to save hostname.");
+    }
+
+    app_config_snapshot_t config;
+    app_config_get_snapshot(&config);
+    return send_hostname_result(request, &config);
+}
+
+static void restart_timer_callback(void *argument)
+{
+    (void)argument;
+    esp_restart();
+}
+
+static esp_err_t settings_restart_handler(httpd_req_t *request)
+{
+    app_config_snapshot_t config;
+    app_config_get_snapshot(&config);
+    if (!config.hostname_restart_pending) {
+        return send_json_error(
+            request, "409 Conflict", "No hostname restart is pending.");
+    }
+    if (esp_timer_is_active(restart_timer)) {
+        return send_json_error(
+            request, "409 Conflict", "Clock 2 is already restarting.");
+    }
+
+    char next_url[APP_HOSTNAME_BUFFER_SIZE + sizeof("http://.local/")];
+    snprintf(next_url, sizeof(next_url),
+             "http://%s.local/", config.configured_hostname);
+
+    /* Unauthenticated trusted-LAN configuration endpoint by design. */
+    const esp_err_t timer_result = esp_timer_start_once(
+        restart_timer, RESTART_DELAY_US);
+    if (timer_result != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to schedule restart: %s",
+                 esp_err_to_name(timer_result));
+        return send_json_error(
+            request, "500 Internal Server Error", "Unable to schedule restart.");
+    }
+
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    ESP_RETURN_ON_ERROR(
+        SEND_LITERAL(request, "{\"ok\":true,\"message\":\"Clock 2 is restarting.\",\"next_url\":"),
+        TAG,
+        "Restart response prefix failed");
+    ESP_RETURN_ON_ERROR(send_json_string(request, next_url),
+                        TAG, "Restart URL failed");
+    ESP_RETURN_ON_ERROR(SEND_LITERAL(request, "}"),
+                        TAG, "Restart response close failed");
+    ESP_RETURN_ON_ERROR(httpd_resp_send_chunk(request, NULL, 0),
+                        TAG, "Restart response failed");
+
+    return ESP_OK;
+}
+
 static esp_err_t health_handler(httpd_req_t *request)
 {
     ethernet_snapshot_t ethernet;
@@ -482,6 +756,15 @@ esp_err_t web_server_start(void)
 
     initialize_system_info();
 
+    const esp_timer_create_args_t restart_timer_args = {
+        .callback = restart_timer_callback,
+        .name = "clock2-restart",
+    };
+    ESP_RETURN_ON_ERROR(
+        esp_timer_create(&restart_timer_args, &restart_timer),
+        TAG,
+        "Restart timer creation failed");
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WEB_SERVER_PORT;
     config.task_priority = WEB_SERVER_TASK_PRIORITY;
@@ -492,15 +775,21 @@ esp_err_t web_server_start(void)
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
 
-    ESP_RETURN_ON_ERROR(
-        httpd_start(&server, &config),
-        TAG,
-        "HTTP server start failed");
+    const esp_err_t start_result = httpd_start(&server, &config);
+    if (start_result != ESP_OK) {
+        esp_timer_delete(restart_timer);
+        restart_timer = NULL;
+        return start_result;
+    }
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = status_page_handler},
-        {.uri = "/advanced", .method = HTTP_GET, .handler = advanced_page_handler},
+        {.uri = "/diagnostics", .method = HTTP_GET, .handler = diagnostics_page_handler},
+        {.uri = "/settings", .method = HTTP_GET, .handler = settings_page_handler},
+        {.uri = "/advanced", .method = HTTP_GET, .handler = advanced_redirect_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_json_handler},
+        {.uri = "/api/settings/hostname", .method = HTTP_POST, .handler = settings_hostname_handler},
+        {.uri = "/api/settings/restart", .method = HTTP_POST, .handler = settings_restart_handler},
         {.uri = "/health", .method = HTTP_GET, .handler = health_handler},
     };
     for (size_t index = 0; index < sizeof(routes) / sizeof(routes[0]); index++) {
@@ -508,6 +797,8 @@ esp_err_t web_server_start(void)
         if (result != ESP_OK) {
             httpd_stop(server);
             server = NULL;
+            esp_timer_delete(restart_timer);
+            restart_timer = NULL;
             return result;
         }
     }
@@ -516,6 +807,8 @@ esp_err_t web_server_start(void)
     if (error_handler_result != ESP_OK) {
         httpd_stop(server);
         server = NULL;
+        esp_timer_delete(restart_timer);
+        restart_timer = NULL;
         return error_handler_result;
     }
 

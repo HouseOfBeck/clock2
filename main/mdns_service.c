@@ -1,17 +1,26 @@
 #include "mdns_service.h"
 
+#include <stdio.h>
+
 #include "esp_log.h"
 #include "mdns.h"
 
-#define CLOCK2_MDNS_HOSTNAME "clock2"
+#include "app_config.h"
+
 #define CLOCK2_INSTANCE_NAME "Clock 2 GPS NTP Server"
 #define CLOCK2_HTTP_INSTANCE_NAME "Clock 2 Status"
 
 static const char *TAG = "clock2-mdns";
+static char active_hostname[APP_HOSTNAME_BUFFER_SIZE];
+static char active_fqdn[APP_HOSTNAME_BUFFER_SIZE + sizeof(".local")];
 
 esp_err_t clock2_mdns_start(void)
 {
     esp_err_t err;
+    app_config_snapshot_t config;
+    app_config_get_snapshot(&config);
+    snprintf(active_hostname, sizeof(active_hostname), "%s", config.active_hostname);
+    snprintf(active_fqdn, sizeof(active_fqdn), "%s.local", config.active_hostname);
 
     err = mdns_init();
     if (err != ESP_OK) {
@@ -19,7 +28,7 @@ esp_err_t clock2_mdns_start(void)
         return err;
     }
 
-    err = mdns_hostname_set(CLOCK2_MDNS_HOSTNAME);
+    err = mdns_hostname_set(active_hostname);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mdns_hostname_set failed: %s",
                  esp_err_to_name(err));
@@ -65,13 +74,12 @@ esp_err_t clock2_mdns_start(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "mDNS hostname: %s.local",
-             CLOCK2_MDNS_HOSTNAME);
+    ESP_LOGI(TAG, "mDNS hostname: %s", active_fqdn);
 
     return ESP_OK;
 }
 
 const char *clock2_mdns_hostname(void)
 {
-    return CLOCK2_MDNS_HOSTNAME ".local";
+    return active_fqdn;
 }

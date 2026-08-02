@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS
         "main.c"
+        "app_config.c"
+        "hostname_validation.c"
         "gps_uart.c"
         "nmea_timing.c"
         "ntp_path_diagnostics.c"
@@ -28,6 +30,7 @@ idf_component_register(
         esp_timer
         lwip
         mdns
+        nvs_flash
         spi_flash
 )
 
