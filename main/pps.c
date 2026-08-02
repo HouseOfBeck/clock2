@@ -69,6 +69,16 @@ esp_err_t pps_start(void)
     return ESP_OK;
 }
 
+void pps_get_snapshot(pps_snapshot_t *snapshot)
+{
+    portENTER_CRITICAL(&pps_lock);
+
+    snapshot->count = pps_count;
+    snapshot->timestamp_us = pps_timestamp_us;
+
+    portEXIT_CRITICAL(&pps_lock);
+}
+
 void pps_log_latest(void)
 {
     static uint32_t displayed_pps_count;

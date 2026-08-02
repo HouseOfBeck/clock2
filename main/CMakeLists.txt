@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "gps_uart.c"
+        "nmea_timing.c"
         "pps.c"
         "ethernet.c"
         "mdns_service.c"

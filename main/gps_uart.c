@@ -7,11 +7,16 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 
+#include "nmea_timing.h"
+
 #define GPS_UART         UART_NUM_1
 #define GPS_RX_GPIO      45
 #define GPS_TX_GPIO      UART_PIN_NO_CHANGE
 #define GPS_BAUD_RATE    9600
 #define GPS_BUFFER_SIZE  1024
+
+/* Set to 0 to stop printing raw NMEA without disabling timing analysis. */
+#define GPS_UART_RAW_DUMP_ENABLED 1
 
 static const char *TAG = "clock2-gps";
 
@@ -68,9 +73,9 @@ esp_err_t gps_uart_start(void)
     return ESP_OK;
 }
 
-void gps_uart_print_raw(void)
+void gps_uart_poll(void)
 {
-    uint8_t buffer[GPS_BUFFER_SIZE + 1];
+    uint8_t buffer[GPS_BUFFER_SIZE];
 
     const int length = uart_read_bytes(
         GPS_UART,
@@ -79,8 +84,11 @@ void gps_uart_print_raw(void)
         pdMS_TO_TICKS(100));
 
     if (length > 0) {
-        buffer[length] = '\0';
-        printf("%s", (char *)buffer);
+        nmea_timing_process_bytes(buffer, length);
+
+#if GPS_UART_RAW_DUMP_ENABLED
+        fwrite(buffer, 1, length, stdout);
         fflush(stdout);
+#endif
     }
 }

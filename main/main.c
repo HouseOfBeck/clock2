@@ -20,7 +20,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Clock 2 GPS, PPS, Ethernet, and mDNS hardware test");
 
     while (true) {
-        gps_uart_print_raw();
+        gps_uart_poll();
         pps_log_latest();
     }
 }
