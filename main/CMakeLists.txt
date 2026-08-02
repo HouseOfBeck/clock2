@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "gps_uart.c"
         "nmea_timing.c"
+        "ntp_path_diagnostics.c"
         "ntp_server.c"
         "pps.c"
         "timebase.c"
@@ -20,4 +21,11 @@ idf_component_register(
         esp_timer
         lwip
         mdns
+)
+
+# Decorate the W5500 GPIO handler without modifying the managed component.
+target_link_options(
+    ${COMPONENT_LIB}
+    INTERFACE
+    "-Wl,--wrap=gpio_isr_handler_add"
 )

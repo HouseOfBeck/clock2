@@ -15,6 +15,7 @@
 #include "lwip/pbuf.h"
 #include "lwip/udp.h"
 
+#include "ntp_path_diagnostics.h"
 #include "timebase.h"
 
 #define NTP_SERVER_PORT             123
@@ -137,7 +138,8 @@ static void unix_time_to_ntp(
 
 static bool get_current_ntp_time(
     ntp_timestamp_t *current_timestamp,
-    ntp_timestamp_t *reference_timestamp)
+    ntp_timestamp_t *reference_timestamp,
+    int64_t *sample_timestamp_us)
 {
     timebase_snapshot_t snapshot;
     if (!timebase_get_snapshot(&snapshot) || !snapshot.valid) {
@@ -165,6 +167,10 @@ static bool get_current_ntp_time(
             reference_timestamp);
     }
 
+    if (sample_timestamp_us != NULL) {
+        *sample_timestamp_us = now_us;
+    }
+
     return true;
 }
 
@@ -177,9 +183,20 @@ static void ntp_receive_callback(
 {
     (void)arg;
 
+#if NTP_PATH_DIAGNOSTICS
+    const int64_t callback_entry_us = esp_timer_get_time();
+    ntp_path_rx_snapshot_t path_snapshot;
+#endif
+
     if (request_pbuf == NULL) {
         return;
     }
+
+#if NTP_PATH_DIAGNOSTICS
+    ntp_path_diagnostics_capture_rx(
+        callback_entry_us,
+        &path_snapshot);
+#endif
 
     stats_record_received();
 
@@ -219,7 +236,11 @@ static void ntp_receive_callback(
         .origin_timestamp = request.transmit_timestamp,
     };
 
-    if (!get_current_ntp_time(&reply.receive_timestamp, NULL)) {
+    int64_t receive_timestamp_sample_us = 0;
+    if (!get_current_ntp_time(
+            &reply.receive_timestamp,
+            NULL,
+            &receive_timestamp_sample_us)) {
         stats_record_ignored(true);
         return;
     }
@@ -241,7 +262,8 @@ static void ntp_receive_callback(
     /* Generate transmit and reference timestamps immediately before send. */
     if (!get_current_ntp_time(
             &reply.transmit_timestamp,
-            &reply.reference_timestamp)) {
+            &reply.reference_timestamp,
+            NULL)) {
         pbuf_free(response_pbuf);
         stats_record_ignored(true);
         return;
@@ -256,18 +278,27 @@ static void ntp_receive_callback(
         return;
     }
 
-    ESP_LOGI(
-        TAG,
-        "NTP TX pbuf len=%u tot_len=%u",
-        (unsigned)response_pbuf->len,
-        (unsigned)response_pbuf->tot_len);
-
+#if NTP_PATH_DIAGNOSTICS
+    const int64_t before_send_us = esp_timer_get_time();
+#endif
     const err_t send_result = udp_sendto(
         pcb,
         response_pbuf,
         client_address,
         client_port);
+#if NTP_PATH_DIAGNOSTICS
+    const int64_t after_send_us = esp_timer_get_time();
+#endif
     pbuf_free(response_pbuf);
+
+#if NTP_PATH_DIAGNOSTICS
+    ntp_path_diagnostics_log_request(
+        &path_snapshot,
+        callback_entry_us,
+        receive_timestamp_sample_us,
+        before_send_us,
+        after_send_us);
+#endif
 
     if (send_result != ERR_OK) {
         stats_record_ignored(false);

@@ -16,6 +16,8 @@
 #include "esp_eth_mac_w5500.h"
 #include "esp_eth_phy_w5500.h"
 
+#include "ntp_path_diagnostics.h"
+
 #define ETH_SPI_HOST       SPI2_HOST
 #define ETH_MOSI_GPIO      11
 #define ETH_MISO_GPIO      12
@@ -165,6 +167,7 @@ esp_err_t ethernet_start(void)
             &spi_device_config);
 
     w5500_config.base.int_gpio_num = ETH_INT_GPIO;
+    ntp_path_diagnostics_configure_w5500(&w5500_config);
 
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
 
