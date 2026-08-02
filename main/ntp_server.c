@@ -260,10 +260,17 @@ static void ntp_receive_callback(
     }
 
     /* Generate transmit and reference timestamps immediately before send. */
+#if NTP_PATH_DIAGNOSTICS
+    int64_t transmit_timestamp_sample_us = 0;
+#endif
     if (!get_current_ntp_time(
             &reply.transmit_timestamp,
             &reply.reference_timestamp,
+#if NTP_PATH_DIAGNOSTICS
+            &transmit_timestamp_sample_us)) {
+#else
             NULL)) {
+#endif
         pbuf_free(response_pbuf);
         stats_record_ignored(true);
         return;
@@ -288,6 +295,11 @@ static void ntp_receive_callback(
         client_port);
 #if NTP_PATH_DIAGNOSTICS
     const int64_t after_send_us = esp_timer_get_time();
+    ntp_path_tx_snapshot_t tx_path_snapshot;
+    ntp_path_diagnostics_capture_tx(
+        before_send_us,
+        after_send_us,
+        &tx_path_snapshot);
 #endif
     pbuf_free(response_pbuf);
 
@@ -296,6 +308,11 @@ static void ntp_receive_callback(
         &path_snapshot,
         callback_entry_us,
         receive_timestamp_sample_us,
+        before_send_us,
+        after_send_us);
+    ntp_path_diagnostics_log_tx(
+        &tx_path_snapshot,
+        transmit_timestamp_sample_us,
         before_send_us,
         after_send_us);
 #endif

@@ -13,9 +13,13 @@
 #include "wiznet_spi.h"
 
 #define W5500_SOCKET0_IR_OFFSET        0x0002U
+#define W5500_SOCKET0_CR_OFFSET        0x0001U
 #define W5500_SOCKET0_REGISTER_BSB     0x01U
+#define W5500_SOCKET0_TX_BUFFER_BSB    0x02U
 #define W5500_SOCKET0_RX_BUFFER_BSB    0x03U
 #define W5500_SOCKET_IR_RECV           (1U << 2)
+#define W5500_SOCKET_IR_SEND_OK        (1U << 4)
+#define W5500_SOCKET_COMMAND_SEND      0x20U
 
 #define ETHERNET_HEADER_SIZE           14U
 #define ETHERNET_VLAN_HEADER_SIZE      18U
@@ -23,6 +27,14 @@
 #define ETHERNET_TYPE_VLAN             0x8100U
 #define IPV4_PROTOCOL_UDP              17U
 #define NTP_UDP_PORT                   123U
+#define NTP_UDP_LENGTH                 56U
+
+/*
+ * A normal reply is a 90-byte Ethernet frame before the W5500 adds FCS.
+ * At 100 Mbps it occupies about 8 us from preamble through FCS, or about
+ * 9 us when the 12-byte inter-packet gap is included. These are context
+ * values only; the diagnostics do not compensate any timestamp with them.
+ */
 
 #define NTP_PATH_FRAME_HISTORY_SIZE    4U
 #define NTP_PATH_SUMMARY_INTERVAL      20U
@@ -37,6 +49,15 @@ typedef struct {
 } ntp_path_frame_sample_t;
 
 typedef struct {
+    int64_t spi_write_start_us;
+    int64_t spi_write_done_us;
+    int64_t send_command_us;
+    int64_t send_ok_us;
+    uint32_t sequence;
+    uint32_t ethernet_frame_length;
+} ntp_path_tx_sample_t;
+
+typedef struct {
     uint64_t count;
     uint64_t irq_to_callback_sum_us;
     uint64_t callback_to_send_sum_us;
@@ -45,6 +66,22 @@ typedef struct {
     int64_t callback_to_send_min_us;
     int64_t callback_to_send_max_us;
 } ntp_path_stats_t;
+
+typedef struct {
+    uint64_t count;
+    uint64_t txstamp_to_spi_start_sum_us;
+    uint64_t spi_write_sum_us;
+    uint64_t send_command_to_send_ok_sum_us;
+    uint64_t txstamp_to_send_ok_sum_us;
+    int64_t txstamp_to_spi_start_min_us;
+    int64_t txstamp_to_spi_start_max_us;
+    int64_t spi_write_min_us;
+    int64_t spi_write_max_us;
+    int64_t send_command_to_send_ok_min_us;
+    int64_t send_command_to_send_ok_max_us;
+    int64_t txstamp_to_send_ok_min_us;
+    int64_t txstamp_to_send_ok_max_us;
+} ntp_path_tx_stats_t;
 
 typedef struct {
     gpio_isr_t handler;
@@ -67,6 +104,12 @@ static uint32_t last_consumed_frame_sequence;
 static uint32_t previous_request_irq_sequence;
 static ntp_path_frame_sample_t frame_history[NTP_PATH_FRAME_HISTORY_SIZE];
 static ntp_path_stats_t path_stats;
+static bool ntp_tx_active;
+static ntp_path_tx_sample_t active_tx_sample;
+static uint32_t next_tx_sequence;
+static uint32_t last_consumed_tx_sequence;
+static ntp_path_tx_sample_t tx_history[NTP_PATH_FRAME_HISTORY_SIZE];
+static ntp_path_tx_stats_t tx_path_stats;
 #endif
 
 esp_err_t __real_gpio_isr_handler_add(
@@ -115,7 +158,12 @@ static uint16_t read_u16_be(const uint8_t *bytes)
     return ((uint16_t)bytes[0] << 8) | bytes[1];
 }
 
-static bool is_ntp_ipv4_udp_frame(const uint8_t *frame, uint32_t length)
+static bool get_ipv4_udp_fields(
+    const uint8_t *frame,
+    uint32_t length,
+    uint16_t *source_port,
+    uint16_t *destination_port,
+    uint16_t *udp_length)
 {
     if (length < ETHERNET_HEADER_SIZE) {
         return false;
@@ -145,14 +193,53 @@ static bool is_ntp_ipv4_udp_frame(const uint8_t *frame, uint32_t length)
         return false;
     }
 
-    const uint16_t fragment_offset =
-        read_u16_be(&frame[ip_offset + 6U]) & 0x1FFFU;
-    if (fragment_offset != 0U) {
+    const uint16_t fragmentation =
+        read_u16_be(&frame[ip_offset + 6U]);
+    if ((fragmentation & 0x3FFFU) != 0U) {
         return false;
     }
 
     const uint32_t udp_offset = ip_offset + ip_header_length;
-    return read_u16_be(&frame[udp_offset + 2U]) == NTP_UDP_PORT;
+    const uint16_t parsed_udp_length =
+        read_u16_be(&frame[udp_offset + 4U]);
+    if (parsed_udp_length < 8U ||
+        length < udp_offset + parsed_udp_length) {
+        return false;
+    }
+
+    *source_port = read_u16_be(&frame[udp_offset]);
+    *destination_port = read_u16_be(&frame[udp_offset + 2U]);
+    *udp_length = parsed_udp_length;
+    return true;
+}
+
+static bool is_ntp_request_frame(const uint8_t *frame, uint32_t length)
+{
+    uint16_t source_port;
+    uint16_t destination_port;
+    uint16_t udp_length;
+    return get_ipv4_udp_fields(
+               frame,
+               length,
+               &source_port,
+               &destination_port,
+               &udp_length) &&
+           destination_port == NTP_UDP_PORT;
+}
+
+static bool is_ntp_response_frame(const uint8_t *frame, uint32_t length)
+{
+    uint16_t source_port;
+    uint16_t destination_port;
+    uint16_t udp_length;
+    return get_ipv4_udp_fields(
+               frame,
+               length,
+               &source_port,
+               &destination_port,
+               &udp_length) &&
+           source_port == NTP_UDP_PORT &&
+           udp_length == NTP_UDP_LENGTH;
 }
 
 static bool is_socket0_interrupt_read(uint32_t cmd, uint32_t addr, uint32_t length)
@@ -169,6 +256,27 @@ static bool is_socket0_rx_buffer_read(uint32_t addr, uint32_t length)
     const uint32_t block_select =
         (addr >> WIZNET_BSB_OFFSET) & 0x1FU;
     return block_select == W5500_SOCKET0_RX_BUFFER_BSB && length > 2U;
+}
+
+static bool is_socket0_tx_buffer_write(uint32_t addr)
+{
+    const uint32_t block_select =
+        (addr >> WIZNET_BSB_OFFSET) & 0x1FU;
+    return block_select == W5500_SOCKET0_TX_BUFFER_BSB;
+}
+
+static bool is_socket0_send_command(
+    uint32_t cmd,
+    uint32_t addr,
+    const void *data,
+    uint32_t length)
+{
+    const uint32_t block_select =
+        (addr >> WIZNET_BSB_OFFSET) & 0x1FU;
+    return cmd == W5500_SOCKET0_CR_OFFSET &&
+           block_select == W5500_SOCKET0_REGISTER_BSB &&
+           length == 1U &&
+           ((const uint8_t *)data)[0] == W5500_SOCKET_COMMAND_SEND;
 }
 
 static void *diagnostic_spi_init(const void *config)
@@ -188,7 +296,47 @@ static esp_err_t diagnostic_spi_write(
     const void *data,
     uint32_t length)
 {
-    return wiznet_spi_write(context, cmd, addr, data, length);
+    const bool tx_buffer_write = is_socket0_tx_buffer_write(addr);
+    const bool ntp_response = tx_buffer_write &&
+        is_ntp_response_frame((const uint8_t *)data, length);
+    const bool send_command =
+        is_socket0_send_command(cmd, addr, data, length);
+
+    const int64_t spi_write_start_us = ntp_response
+        ? esp_timer_get_time()
+        : 0;
+    const int64_t send_command_us = send_command
+        ? esp_timer_get_time()
+        : 0;
+
+    const esp_err_t result =
+        wiznet_spi_write(context, cmd, addr, data, length);
+    const int64_t spi_write_done_us =
+        ntp_response && result == ESP_OK ? esp_timer_get_time() : 0;
+
+    if (tx_buffer_write) {
+        portENTER_CRITICAL(&path_lock);
+        ntp_tx_active = false;
+        if (ntp_response && result == ESP_OK) {
+            next_tx_sequence++;
+            active_tx_sample = (ntp_path_tx_sample_t) {
+                .spi_write_start_us = spi_write_start_us,
+                .spi_write_done_us = spi_write_done_us,
+                .sequence = next_tx_sequence,
+                .ethernet_frame_length = length,
+            };
+            ntp_tx_active = true;
+        }
+        portEXIT_CRITICAL(&path_lock);
+    } else if (send_command && result == ESP_OK) {
+        portENTER_CRITICAL(&path_lock);
+        if (ntp_tx_active) {
+            active_tx_sample.send_command_us = send_command_us;
+        }
+        portEXIT_CRITICAL(&path_lock);
+    }
+
+    return result;
 }
 
 static esp_err_t diagnostic_spi_read(
@@ -219,8 +367,23 @@ static esp_err_t diagnostic_spi_read(
         portEXIT_CRITICAL(&path_lock);
     }
 
+    if (interrupt_read &&
+        ((const uint8_t *)data)[0] & W5500_SOCKET_IR_SEND_OK) {
+        const int64_t send_ok_us = esp_timer_get_time();
+
+        /* SEND_OK means the W5500 completed SEND; it is not a PHY edge. */
+        portENTER_CRITICAL(&path_lock);
+        if (ntp_tx_active && active_tx_sample.send_command_us > 0) {
+            active_tx_sample.send_ok_us = send_ok_us;
+            tx_history[active_tx_sample.sequence %
+                       NTP_PATH_FRAME_HISTORY_SIZE] = active_tx_sample;
+            ntp_tx_active = false;
+        }
+        portEXIT_CRITICAL(&path_lock);
+    }
+
     if (is_socket0_rx_buffer_read(addr, length) &&
-        is_ntp_ipv4_udp_frame((const uint8_t *)data, length)) {
+        is_ntp_request_frame((const uint8_t *)data, length)) {
         const int64_t read_done_us = esp_timer_get_time();
 
         portENTER_CRITICAL(&path_lock);
@@ -422,5 +585,183 @@ void ntp_path_diagnostics_log_request(
     (void)receive_timestamp_sample_us;
     (void)before_send_us;
     (void)after_send_us;
+#endif
+}
+
+void ntp_path_diagnostics_capture_tx(
+    int64_t udp_send_entry_us,
+    int64_t udp_send_return_us,
+    ntp_path_tx_snapshot_t *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+
+#if NTP_PATH_DIAGNOSTICS
+    ntp_path_tx_sample_t selected = {0};
+
+    portENTER_CRITICAL(&path_lock);
+    for (uint32_t index = 0; index < NTP_PATH_FRAME_HISTORY_SIZE; index++) {
+        const ntp_path_tx_sample_t *candidate = &tx_history[index];
+        if (candidate->sequence > last_consumed_tx_sequence &&
+            (selected.sequence == 0U ||
+             candidate->sequence < selected.sequence) &&
+            candidate->spi_write_start_us >= udp_send_entry_us &&
+            candidate->send_ok_us <= udp_send_return_us) {
+            selected = *candidate;
+        }
+    }
+    if (selected.sequence != 0U) {
+        last_consumed_tx_sequence = selected.sequence;
+    }
+    portEXIT_CRITICAL(&path_lock);
+
+    snapshot->spi_write_start_us = selected.spi_write_start_us;
+    snapshot->spi_write_done_us = selected.spi_write_done_us;
+    snapshot->send_command_us = selected.send_command_us;
+    snapshot->send_ok_us = selected.send_ok_us;
+    snapshot->sequence = selected.sequence;
+    snapshot->ethernet_frame_length = selected.ethernet_frame_length;
+    snapshot->valid = selected.sequence != 0U &&
+                      selected.spi_write_start_us >= udp_send_entry_us &&
+                      selected.spi_write_done_us >=
+                          selected.spi_write_start_us &&
+                      selected.send_command_us >=
+                          selected.spi_write_done_us &&
+                      selected.send_ok_us >= selected.send_command_us &&
+                      selected.send_ok_us <= udp_send_return_us;
+#else
+    (void)udp_send_entry_us;
+    (void)udp_send_return_us;
+#endif
+}
+
+void ntp_path_diagnostics_log_tx(
+    const ntp_path_tx_snapshot_t *snapshot,
+    int64_t transmit_timestamp_sample_us,
+    int64_t udp_send_entry_us,
+    int64_t udp_send_return_us)
+{
+#if NTP_PATH_DIAGNOSTICS
+    const int64_t txstamp_to_udp_us =
+        udp_send_entry_us - transmit_timestamp_sample_us;
+    const int64_t udp_to_spi_start_us = snapshot->spi_write_start_us > 0
+        ? snapshot->spi_write_start_us - udp_send_entry_us
+        : -1;
+    const int64_t spi_write_us = snapshot->spi_write_start_us > 0 &&
+                                 snapshot->spi_write_done_us > 0
+        ? snapshot->spi_write_done_us - snapshot->spi_write_start_us
+        : -1;
+    const int64_t spi_done_to_send_command_us =
+        snapshot->spi_write_done_us > 0 && snapshot->send_command_us > 0
+            ? snapshot->send_command_us - snapshot->spi_write_done_us
+            : -1;
+    const int64_t send_command_to_send_ok_us =
+        snapshot->send_command_us > 0 && snapshot->send_ok_us > 0
+            ? snapshot->send_ok_us - snapshot->send_command_us
+            : -1;
+    const int64_t txstamp_to_send_ok_us = snapshot->send_ok_us > 0
+        ? snapshot->send_ok_us - transmit_timestamp_sample_us
+        : -1;
+    const int64_t udp_return_us =
+        udp_send_return_us - udp_send_entry_us;
+    const int64_t txstamp_to_spi_start_us =
+        snapshot->spi_write_start_us > 0
+            ? snapshot->spi_write_start_us - transmit_timestamp_sample_us
+            : -1;
+    const bool sample_valid = snapshot->valid &&
+                              transmit_timestamp_sample_us > 0 &&
+                              transmit_timestamp_sample_us <=
+                                  udp_send_entry_us &&
+                              udp_send_entry_us <= udp_send_return_us;
+
+    ESP_LOGI(
+        TAG,
+        "NTP TX path valid=%s txstamp_to_udp=%" PRId64
+        " us udp_to_spi_start=%" PRId64
+        " us spi_write=%" PRId64
+        " us spi_done_to_sendcmd=%" PRId64
+        " us sendcmd_to_sendok=%" PRId64
+        " us txstamp_to_sendok=%" PRId64
+        " us udp_return=%" PRId64
+        " us tx_seq=%" PRIu32 " frame_len=%" PRIu32,
+        sample_valid ? "yes" : "no",
+        txstamp_to_udp_us,
+        udp_to_spi_start_us,
+        spi_write_us,
+        spi_done_to_send_command_us,
+        send_command_to_send_ok_us,
+        txstamp_to_send_ok_us,
+        udp_return_us,
+        snapshot->sequence,
+        snapshot->ethernet_frame_length);
+
+    if (!sample_valid) {
+        return;
+    }
+
+    const uint64_t previous_count = tx_path_stats.count;
+    update_min_max(
+        txstamp_to_spi_start_us,
+        &tx_path_stats.txstamp_to_spi_start_min_us,
+        &tx_path_stats.txstamp_to_spi_start_max_us,
+        previous_count);
+    update_min_max(
+        spi_write_us,
+        &tx_path_stats.spi_write_min_us,
+        &tx_path_stats.spi_write_max_us,
+        previous_count);
+    update_min_max(
+        send_command_to_send_ok_us,
+        &tx_path_stats.send_command_to_send_ok_min_us,
+        &tx_path_stats.send_command_to_send_ok_max_us,
+        previous_count);
+    update_min_max(
+        txstamp_to_send_ok_us,
+        &tx_path_stats.txstamp_to_send_ok_min_us,
+        &tx_path_stats.txstamp_to_send_ok_max_us,
+        previous_count);
+
+    tx_path_stats.count++;
+    tx_path_stats.txstamp_to_spi_start_sum_us +=
+        (uint64_t)txstamp_to_spi_start_us;
+    tx_path_stats.spi_write_sum_us += (uint64_t)spi_write_us;
+    tx_path_stats.send_command_to_send_ok_sum_us +=
+        (uint64_t)send_command_to_send_ok_us;
+    tx_path_stats.txstamp_to_send_ok_sum_us +=
+        (uint64_t)txstamp_to_send_ok_us;
+
+    if (tx_path_stats.count % NTP_PATH_SUMMARY_INTERVAL == 0U) {
+        ESP_LOGI(
+            TAG,
+            "NTP TX path summary n=%" PRIu64
+            " txstamp_to_spi_start_mean=%" PRIu64
+            " us min=%" PRId64 " us max=%" PRId64
+            " us spi_write_mean=%" PRIu64
+            " us min=%" PRId64 " us max=%" PRId64
+            " us sendcmd_to_sendok_mean=%" PRIu64
+            " us min=%" PRId64 " us max=%" PRId64
+            " us txstamp_to_sendok_mean=%" PRIu64
+            " us min=%" PRId64 " us max=%" PRId64 " us",
+            tx_path_stats.count,
+            tx_path_stats.txstamp_to_spi_start_sum_us /
+                tx_path_stats.count,
+            tx_path_stats.txstamp_to_spi_start_min_us,
+            tx_path_stats.txstamp_to_spi_start_max_us,
+            tx_path_stats.spi_write_sum_us / tx_path_stats.count,
+            tx_path_stats.spi_write_min_us,
+            tx_path_stats.spi_write_max_us,
+            tx_path_stats.send_command_to_send_ok_sum_us /
+                tx_path_stats.count,
+            tx_path_stats.send_command_to_send_ok_min_us,
+            tx_path_stats.send_command_to_send_ok_max_us,
+            tx_path_stats.txstamp_to_send_ok_sum_us /
+                tx_path_stats.count,
+            tx_path_stats.txstamp_to_send_ok_min_us,
+            tx_path_stats.txstamp_to_send_ok_max_us);
+    }
+#else
+    (void)snapshot;
+    (void)transmit_timestamp_sample_us;
+    (void)udp_send_entry_us;
+    (void)udp_send_return_us;
 #endif
 }

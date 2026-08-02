@@ -22,6 +22,16 @@ typedef struct {
     uint8_t socket_interrupt_status;
 } ntp_path_rx_snapshot_t;
 
+typedef struct {
+    bool valid;
+    int64_t spi_write_start_us;
+    int64_t spi_write_done_us;
+    int64_t send_command_us;
+    int64_t send_ok_us;
+    uint32_t sequence;
+    uint32_t ethernet_frame_length;
+} ntp_path_tx_snapshot_t;
+
 void ntp_path_diagnostics_configure_w5500(
     eth_w5500_config_t *w5500_config);
 
@@ -35,3 +45,14 @@ void ntp_path_diagnostics_log_request(
     int64_t receive_timestamp_sample_us,
     int64_t before_send_us,
     int64_t after_send_us);
+
+void ntp_path_diagnostics_capture_tx(
+    int64_t udp_send_entry_us,
+    int64_t udp_send_return_us,
+    ntp_path_tx_snapshot_t *snapshot);
+
+void ntp_path_diagnostics_log_tx(
+    const ntp_path_tx_snapshot_t *snapshot,
+    int64_t transmit_timestamp_sample_us,
+    int64_t udp_send_entry_us,
+    int64_t udp_send_return_us);
