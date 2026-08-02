@@ -74,6 +74,7 @@ static const char *TAG = "clock2-ntp";
 static struct udp_pcb *ntp_pcb;
 static portMUX_TYPE stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static ntp_server_stats_t stats;
+static bool server_running;
 
 #if NTP_PATH_DIAGNOSTICS
 typedef struct {
@@ -133,6 +134,27 @@ void ntp_server_log_stats(void)
         snapshot.transmitted_packets,
         snapshot.ignored_packets,
         snapshot.invalid_timebase_requests);
+}
+
+void ntp_server_get_snapshot(ntp_server_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&stats_lock);
+    *snapshot = (ntp_server_snapshot_t) {
+        .running = server_running,
+        .port = NTP_SERVER_PORT,
+        .stratum = NTP_STRATUM_PRIMARY,
+        .precision = NTP_PRECISION_EXPONENT,
+        .received_packets = stats.received_packets,
+        .transmitted_packets = stats.transmitted_packets,
+        .ignored_packets = stats.ignored_packets,
+        .invalid_timebase_requests = stats.invalid_timebase_requests,
+    };
+    portEXIT_CRITICAL(&stats_lock);
+    memcpy(snapshot->reference_id, "GPS", 4);
 }
 
 static void ntp_value_to_network_timestamp(
@@ -437,6 +459,10 @@ void ntp_server_start(void)
     ESP_ERROR_CHECK(esp_netif_tcpip_exec(
         ntp_server_init_in_tcpip,
         NULL));
+
+    portENTER_CRITICAL(&stats_lock);
+    server_running = true;
+    portEXIT_CRITICAL(&stats_lock);
 
     ESP_LOGI(TAG, "NTP server started on UDP port %d", NTP_SERVER_PORT);
 }

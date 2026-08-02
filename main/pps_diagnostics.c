@@ -32,9 +32,8 @@ typedef struct {
     int64_t maximum_us;
 } pps_capture_stats_t;
 
-static const char *TAG = "clock2-pps-diag";
-
 #if PPS_PATH_DIAGNOSTICS
+static const char *TAG = "clock2-pps-diag";
 static portMUX_TYPE diagnostic_lock = portMUX_INITIALIZER_UNLOCKED;
 static mcpwm_cap_timer_handle_t capture_timer;
 static mcpwm_cap_channel_handle_t capture_channel;
@@ -339,5 +338,41 @@ void pps_diagnostics_log_latest(void)
             edges.falling_us - edges.rising_us);
         logged_falling_sequence = edges.falling_sequence;
     }
+#endif
+}
+
+void pps_diagnostics_get_snapshot(pps_diagnostics_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+
+    *snapshot = (pps_diagnostics_snapshot_t) {
+        .diagnostics_enabled = PPS_PATH_DIAGNOSTICS != 0,
+        .selected_edge = "rising",
+    };
+
+#if PPS_PATH_DIAGNOSTICS
+    pps_edge_state_t edges;
+    pps_capture_stats_t stats;
+    bool hardware_available;
+
+    portENTER_CRITICAL(&diagnostic_lock);
+    edges = edge_state;
+    stats = capture_stats;
+    hardware_available = capture_available;
+    portEXIT_CRITICAL(&diagnostic_lock);
+
+    snapshot->hardware_capture_available = hardware_available;
+    snapshot->pulse_width_valid =
+        edges.rising_us > 0 && edges.falling_us >= edges.rising_us;
+    snapshot->pulse_width_us = snapshot->pulse_width_valid
+                                   ? edges.falling_us - edges.rising_us
+                                   : 0;
+    snapshot->capture_samples = stats.count;
+    snapshot->capture_delta_mean_us =
+        stats.count == 0U ? 0 : stats.sum_us / (int64_t)stats.count;
+    snapshot->capture_delta_minimum_us = stats.minimum_us;
+    snapshot->capture_delta_maximum_us = stats.maximum_us;
 #endif
 }

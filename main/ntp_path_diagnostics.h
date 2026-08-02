@@ -7,7 +7,7 @@
 
 /* Set to 0 to remove per-packet path instrumentation and logging. */
 #ifndef NTP_PATH_DIAGNOSTICS
-#define NTP_PATH_DIAGNOSTICS 1
+#define NTP_PATH_DIAGNOSTICS 0
 #endif
 
 #define NTP_PATH_IRQ_STALE_WINDOW_US 20000

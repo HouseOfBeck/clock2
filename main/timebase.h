@@ -24,6 +24,24 @@ typedef struct {
     char source[4];
 } timebase_snapshot_t;
 
+typedef struct {
+    bool valid;
+    int64_t unix_seconds;
+    uint32_t pps_count;
+    int64_t pps_age_us;
+    int64_t gnss_label_age_us;
+    char source[4];
+    uint64_t accepted_associations;
+    uint64_t rejected_associations;
+} timebase_status_snapshot_t;
+
+typedef struct {
+    int64_t association_min_us;
+    int64_t association_max_us;
+    int64_t pps_timeout_us;
+    int64_t gnss_timeout_us;
+} timebase_config_snapshot_t;
+
 /* Small, deterministic helpers intended to be directly unit-testable. */
 bool timebase_nmea_checksum_valid(const char *sentence);
 bool timebase_parse_zda(const char *sentence, timebase_utc_t *utc);
@@ -40,6 +58,12 @@ void timebase_process_sentence(
     const char *sentence,
     int64_t estimated_arrival_us);
 bool timebase_get_snapshot(timebase_snapshot_t *snapshot);
+void timebase_get_status_snapshot(timebase_status_snapshot_t *snapshot);
+void timebase_get_config_snapshot(timebase_config_snapshot_t *snapshot);
+bool timebase_format_unix_utc(
+    int64_t unix_seconds,
+    char *buffer,
+    size_t buffer_size);
 
 /* Rejected sentences preserve the anchor; freshness loss is handled here. */
 void timebase_poll(void);

@@ -389,6 +389,18 @@ static void format_utc(
         utc.second);
 }
 
+bool timebase_format_unix_utc(
+    int64_t unix_seconds,
+    char *buffer,
+    size_t buffer_size)
+{
+    if (buffer == NULL || buffer_size < 21U || unix_seconds < 0) {
+        return false;
+    }
+    format_utc(unix_seconds, buffer, buffer_size);
+    return true;
+}
+
 static void reject_association(
     const char *reason,
     bool include_delay,
@@ -456,6 +468,62 @@ bool timebase_get_snapshot(timebase_snapshot_t *snapshot)
     snapshot->age_us = pps_age_us;
     memcpy(snapshot->source, source_name(current.source), 4);
     return true;
+}
+
+void timebase_get_status_snapshot(timebase_status_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+
+    pps_snapshot_t pps;
+    pps_get_snapshot(&pps);
+    const int64_t now_us = esp_timer_get_time();
+
+    timebase_state_t current;
+    portENTER_CRITICAL(&timebase_lock);
+    current = state;
+    portEXIT_CRITICAL(&timebase_lock);
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->pps_count = pps.count;
+    snapshot->pps_age_us = pps.timestamp_us == 0
+                               ? -1
+                               : now_us - pps.timestamp_us;
+    snapshot->gnss_label_age_us = current.last_update_us == 0
+                                      ? -1
+                                      : now_us - current.last_update_us;
+    snapshot->accepted_associations = current.accepted_associations;
+    snapshot->rejected_associations = current.rejected_associations;
+    memcpy(snapshot->source, source_name(current.source), 4);
+
+    const uint32_t pps_delta =
+        (uint32_t)(pps.count - current.anchor_pps_count);
+    snapshot->valid = current.valid && pps.timestamp_us != 0 &&
+                      snapshot->pps_age_us >= 0 &&
+                      snapshot->pps_age_us <= TIMEBASE_PPS_TIMEOUT_US &&
+                      snapshot->gnss_label_age_us >= 0 &&
+                      snapshot->gnss_label_age_us <=
+                          TIMEBASE_GNSS_TIMEOUT_US &&
+                      pps_delta <= UINT32_MAX / 2U;
+    if (snapshot->valid) {
+        snapshot->unix_seconds =
+            current.anchor_unix_seconds + (int64_t)pps_delta;
+    }
+}
+
+void timebase_get_config_snapshot(timebase_config_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+
+    *snapshot = (timebase_config_snapshot_t) {
+        .association_min_us = TIMEBASE_ASSOCIATION_MIN_US,
+        .association_max_us = TIMEBASE_ASSOCIATION_MAX_US,
+        .pps_timeout_us = TIMEBASE_PPS_TIMEOUT_US,
+        .gnss_timeout_us = TIMEBASE_GNSS_TIMEOUT_US,
+    };
 }
 
 static void log_health_summary(void)

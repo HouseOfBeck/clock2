@@ -20,6 +20,10 @@ static volatile uint32_t pps_count;
 static volatile int64_t pps_timestamp_us;
 static volatile int64_t pps_previous_us;
 static volatile uint32_t pps_isr_sequence;
+static volatile uint64_t pps_interval_samples;
+static volatile int64_t pps_interval_sum_us;
+static volatile int64_t pps_interval_minimum_us;
+static volatile int64_t pps_interval_maximum_us;
 
 static void IRAM_ATTR pps_isr_handler(void *arg)
 {
@@ -44,9 +48,24 @@ static void IRAM_ATTR pps_isr_handler(void *arg)
          * pps_timestamp_us remains the ISR-entry timestamp above.
          */
         store_delay_us = esp_timer_get_time() - isr_timestamp_us;
-        pps_previous_us = pps_timestamp_us;
+        const int64_t previous_us = pps_timestamp_us;
+        pps_previous_us = previous_us;
         pps_timestamp_us = isr_timestamp_us;
         pps_count++;
+
+        if (previous_us != 0) {
+            const int64_t interval_us = isr_timestamp_us - previous_us;
+            if (pps_interval_samples == 0U ||
+                interval_us < pps_interval_minimum_us) {
+                pps_interval_minimum_us = interval_us;
+            }
+            if (pps_interval_samples == 0U ||
+                interval_us > pps_interval_maximum_us) {
+                pps_interval_maximum_us = interval_us;
+            }
+            pps_interval_samples++;
+            pps_interval_sum_us += interval_us;
+        }
     }
 
     portEXIT_CRITICAL_ISR(&pps_lock);
@@ -118,6 +137,42 @@ void pps_get_snapshot(pps_snapshot_t *snapshot)
     snapshot->timestamp_us = pps_timestamp_us;
 
     portEXIT_CRITICAL(&pps_lock);
+}
+
+void pps_get_status_snapshot(pps_status_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&pps_lock);
+    snapshot->count = pps_count;
+    snapshot->timestamp_us = pps_timestamp_us;
+    snapshot->last_interval_us =
+        pps_previous_us == 0
+            ? 0
+            : pps_timestamp_us - pps_previous_us;
+    snapshot->interval_samples = pps_interval_samples;
+    snapshot->mean_interval_us =
+        pps_interval_samples == 0U
+            ? 0
+            : pps_interval_sum_us / (int64_t)pps_interval_samples;
+    snapshot->minimum_interval_us = pps_interval_minimum_us;
+    snapshot->maximum_interval_us = pps_interval_maximum_us;
+    portEXIT_CRITICAL(&pps_lock);
+
+    snapshot->age_us = snapshot->timestamp_us == 0
+                           ? -1
+                           : now_us - snapshot->timestamp_us;
+    snapshot->valid = snapshot->timestamp_us != 0 &&
+                      snapshot->age_us >= 0 &&
+                      snapshot->age_us <= 2500000;
+}
+
+int pps_get_gpio_num(void)
+{
+    return GPS_PPS_GPIO;
 }
 
 void pps_log_latest(void)

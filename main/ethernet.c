@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -15,6 +16,7 @@
 #include "esp_netif.h"
 #include "esp_eth_mac_w5500.h"
 #include "esp_eth_phy_w5500.h"
+#include "freertos/FreeRTOS.h"
 
 #include "ntp_path_diagnostics.h"
 
@@ -33,6 +35,16 @@ static const char *TAG = "clock2-eth";
 static esp_eth_handle_t eth_handle;
 static esp_netif_t *eth_netif;
 static esp_eth_netif_glue_handle_t eth_glue;
+static portMUX_TYPE ethernet_lock = portMUX_INITIALIZER_UNLOCKED;
+static ethernet_snapshot_t ethernet_state = {
+    .mosi_gpio = ETH_MOSI_GPIO,
+    .miso_gpio = ETH_MISO_GPIO,
+    .sclk_gpio = ETH_SCLK_GPIO,
+    .cs_gpio = ETH_CS_GPIO,
+    .int_gpio = ETH_INT_GPIO,
+    .reset_gpio = ETH_RESET_GPIO,
+    .spi_clock_hz = ETH_SPI_CLOCK_HZ,
+};
 
 static void ethernet_event_handler(
     void *arg,
@@ -47,6 +59,9 @@ static void ethernet_event_handler(
 
     switch (event_id) {
     case ETHERNET_EVENT_START:
+        portENTER_CRITICAL(&ethernet_lock);
+        ethernet_state.running = true;
+        portEXIT_CRITICAL(&ethernet_lock);
         ESP_LOGI(TAG, "Ethernet started");
         break;
 
@@ -55,6 +70,11 @@ static void ethernet_event_handler(
 
         ESP_ERROR_CHECK(
             esp_eth_ioctl(handle, ETH_CMD_G_MAC_ADDR, mac));
+
+        portENTER_CRITICAL(&ethernet_lock);
+        ethernet_state.link_up = true;
+        memcpy(ethernet_state.mac, mac, sizeof(mac));
+        portEXIT_CRITICAL(&ethernet_lock);
 
         ESP_LOGI(TAG, "Ethernet link up");
         ESP_LOGI(
@@ -66,10 +86,22 @@ static void ethernet_event_handler(
     }
 
     case ETHERNET_EVENT_DISCONNECTED:
+        portENTER_CRITICAL(&ethernet_lock);
+        ethernet_state.link_up = false;
+        ethernet_state.has_ipv4 = false;
+        ethernet_state.ipv4 = 0;
+        ethernet_state.netmask = 0;
+        ethernet_state.gateway = 0;
+        portEXIT_CRITICAL(&ethernet_lock);
         ESP_LOGW(TAG, "Ethernet link down");
         break;
 
     case ETHERNET_EVENT_STOP:
+        portENTER_CRITICAL(&ethernet_lock);
+        ethernet_state.running = false;
+        ethernet_state.link_up = false;
+        ethernet_state.has_ipv4 = false;
+        portEXIT_CRITICAL(&ethernet_lock);
         ESP_LOGI(TAG, "Ethernet stopped");
         break;
 
@@ -96,6 +128,14 @@ static void ethernet_got_ip_handler(
     uint8_t mac[6] = {0};
     ESP_ERROR_CHECK(
         esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac));
+
+    portENTER_CRITICAL(&ethernet_lock);
+    ethernet_state.has_ipv4 = true;
+    ethernet_state.ipv4 = ip_info->ip.addr;
+    ethernet_state.netmask = ip_info->netmask.addr;
+    ethernet_state.gateway = ip_info->gw.addr;
+    memcpy(ethernet_state.mac, mac, sizeof(mac));
+    portEXIT_CRITICAL(&ethernet_lock);
 
     ESP_LOGI(TAG, "DHCP address acquired");
     ESP_LOGI(
@@ -228,6 +268,10 @@ esp_err_t ethernet_start(void)
         TAG,
         "Could not obtain Ethernet MAC address");
 
+    portENTER_CRITICAL(&ethernet_lock);
+    memcpy(ethernet_state.mac, mac_address, sizeof(mac_address));
+    portEXIT_CRITICAL(&ethernet_lock);
+
     ESP_RETURN_ON_ERROR(
         esp_eth_ioctl(
             eth_handle,
@@ -298,4 +342,16 @@ esp_err_t ethernet_start(void)
         "Could not start Ethernet");
 
     return ESP_OK;
+}
+
+bool ethernet_get_snapshot(ethernet_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&ethernet_lock);
+    *snapshot = ethernet_state;
+    portEXIT_CRITICAL(&ethernet_lock);
+    return true;
 }

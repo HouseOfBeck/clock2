@@ -11,19 +11,24 @@ idf_component_register(
         "timebase.c"
         "ethernet.c"
         "mdns_service.c"
+        "web_assets.c"
+        "web_server.c"
     INCLUDE_DIRS
         "."
     REQUIRES
+        esp_app_format
         esp_driver_gpio
         esp_driver_mcpwm
         esp_driver_spi
         esp_driver_uart
         esp_eth
         esp_event
+        esp_http_server
         esp_netif
         esp_timer
         lwip
         mdns
+        spi_flash
 )
 
 # Decorate the W5500 GPIO handler without modifying the managed component.

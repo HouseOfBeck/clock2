@@ -184,3 +184,21 @@ void gps_uart_poll(void)
         break;
     }
 }
+
+void gps_uart_get_config_snapshot(gps_uart_config_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+
+    *snapshot = (gps_uart_config_snapshot_t) {
+        .uart_num = GPS_UART,
+        .rx_gpio = GPS_RX_GPIO,
+        .tx_gpio = GPS_TX_GPIO,
+        .baud_rate = GPS_BAUD_RATE,
+        .rx_timeout_symbols = GPS_UART_RX_TIMEOUT_SYMBOLS,
+        .raw_dump_enabled = GPS_UART_RAW_DUMP_ENABLED != 0,
+        .event_diagnostics_enabled =
+            GPS_UART_EVENT_DIAGNOSTICS_ENABLED != 0,
+    };
+}
