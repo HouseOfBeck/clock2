@@ -5,7 +5,6 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "esp_timer.h"
 
 #include "pps.h"
 
@@ -13,6 +12,9 @@
 #define NMEA_UTC_BUFFER_SIZE        24
 #define NMEA_MAX_VALID_DELAY_US     1500000
 #define NMEA_SUMMARY_SAMPLE_COUNT   60
+
+/* 9600 baud, 8N1: one start bit, eight data bits, and one stop bit. */
+#define NMEA_UART_BYTE_TIME_US       (1000000LL * 10 / 9600)
 
 typedef enum {
     NMEA_SENTENCE_GGA,
@@ -34,6 +36,8 @@ static const char *TAG = "clock2-nmea";
 static char line_buffer[NMEA_LINE_BUFFER_SIZE];
 static size_t line_length;
 static bool discarding_line;
+static bool line_awaiting_lf;
+static int64_t cr_arrival_us;
 
 static nmea_timing_stats_t timing_stats[NMEA_SENTENCE_COUNT];
 static uint64_t total_valid_samples;
@@ -100,7 +104,7 @@ static void extract_utc(const char *field, char *utc, size_t utc_size)
 
 static void print_summary(void)
 {
-    ESP_LOGI(TAG, "NMEA timing summary");
+    ESP_LOGI(TAG, "NMEA estimated timing summary");
 
     for (nmea_sentence_type_t type = NMEA_SENTENCE_GGA;
          type < NMEA_SENTENCE_COUNT;
@@ -151,7 +155,7 @@ static void record_valid_sample(
     }
 }
 
-static void process_line(void)
+static void process_line(int64_t estimated_arrival_us)
 {
     line_buffer[line_length] = '\0';
 
@@ -163,7 +167,6 @@ static void process_line(void)
         return;
     }
 
-    const int64_t arrival_us = esp_timer_get_time();
     pps_snapshot_t pps;
     pps_get_snapshot(&pps);
 
@@ -173,19 +176,19 @@ static void process_line(void)
     if (pps.count == 0) {
         ESP_LOGI(
             TAG,
-            "NMEA %s utc=%s pps=none delay=unavailable",
+            "NMEA %s utc=%s pps=none estimated_delay=unavailable",
             sentence_type_name(type),
             utc);
         return;
     }
 
-    const int64_t delay_us = arrival_us - pps.timestamp_us;
+    const int64_t delay_us = estimated_arrival_us - pps.timestamp_us;
 
     if (delay_us < 0 || delay_us > NMEA_MAX_VALID_DELAY_US) {
         ESP_LOGW(
             TAG,
             "NMEA %s utc=%s pps=%" PRIu32
-            " delay=%" PRId64 " us invalid",
+            " estimated_delay=%" PRId64 " us invalid",
             sentence_type_name(type),
             utc,
             pps.count,
@@ -195,7 +198,8 @@ static void process_line(void)
 
     ESP_LOGI(
         TAG,
-        "NMEA %s utc=%s pps=%" PRIu32 " delay=%" PRId64 " us",
+        "NMEA %s utc=%s pps=%" PRIu32
+        " estimated_delay=%" PRId64 " us",
         sentence_type_name(type),
         utc,
         pps.count,
@@ -204,17 +208,52 @@ static void process_line(void)
     record_valid_sample(type, delay_us);
 }
 
-static void process_byte(uint8_t byte)
+static bool complete_line(int64_t estimated_arrival_us)
 {
-    if (byte == '\r' || byte == '\n') {
+    if (discarding_line) {
+        discarding_line = false;
+        line_length = 0;
+        return false;
+    }
+
+    if (line_length == 0) {
+        return false;
+    }
+
+    process_line(estimated_arrival_us);
+    line_length = 0;
+    return true;
+}
+
+static bool process_byte(uint8_t byte, int64_t estimated_arrival_us)
+{
+    bool completed_line = false;
+
+    if (line_awaiting_lf) {
+        line_awaiting_lf = false;
+
+        if (byte == '\n') {
+            return complete_line(estimated_arrival_us);
+        }
+
+        /* A bare CR also terminates a line when no LF follows it. */
+        completed_line = complete_line(cr_arrival_us);
+    }
+
+    if (byte == '\r') {
         if (discarding_line) {
             discarding_line = false;
             line_length = 0;
         } else if (line_length > 0) {
-            process_line();
-            line_length = 0;
+            /* Wait for a possible LF so CRLF uses the true final byte. */
+            line_awaiting_lf = true;
+            cr_arrival_us = estimated_arrival_us;
         }
-        return;
+        return completed_line;
+    }
+
+    if (byte == '\n') {
+        return complete_line(estimated_arrival_us) || completed_line;
     }
 
     if (byte == '$') {
@@ -223,26 +262,50 @@ static void process_byte(uint8_t byte)
     }
 
     if (discarding_line) {
-        return;
+        return completed_line;
     }
 
     if (byte < 0x20 || byte > 0x7e) {
         discarding_line = true;
-        return;
+        return completed_line;
     }
 
     if (line_length >= sizeof(line_buffer) - 1) {
         discarding_line = true;
         ESP_LOGW(TAG, "Discarding overlong NMEA line");
-        return;
+        return completed_line;
     }
 
     line_buffer[line_length++] = (char)byte;
+    return completed_line;
 }
 
-void nmea_timing_process_bytes(const uint8_t *data, size_t length)
+size_t nmea_timing_process_uart_event_bytes(
+    const uint8_t *data,
+    size_t length,
+    int64_t event_timestamp_us,
+    size_t later_event_bytes)
 {
+    size_t complete_lines = 0;
+
     for (size_t index = 0; index < length; index++) {
-        process_byte(data[index]);
+        const size_t later_bytes =
+            later_event_bytes + length - index - 1;
+
+        /*
+         * This is an estimate of when this byte finished arriving on the
+         * wire. The event timestamp is captured when the task dequeues the
+         * UART event, then shifted backward by the wire time of all later
+         * bytes belonging to that same event.
+         */
+        const int64_t estimated_arrival_us =
+            event_timestamp_us -
+            (int64_t)later_bytes * NMEA_UART_BYTE_TIME_US;
+
+        if (process_byte(data[index], estimated_arrival_us)) {
+            complete_lines++;
+        }
     }
+
+    return complete_lines;
 }
