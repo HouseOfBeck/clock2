@@ -4,3 +4,6 @@ sdkconfig.old
 
 # macOS
 .DS_Store
+
+# ESP-IDF managed dependencies
+managed_components/
