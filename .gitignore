@@ -1,0 +1,6 @@
+# ESP-IDF generated files
+build/
+sdkconfig.old
+
+# macOS
+.DS_Store
