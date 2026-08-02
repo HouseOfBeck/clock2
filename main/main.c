@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ethernet.h"
+#include "mdns_service.h"
 
 #define GPS_UART         UART_NUM_1
 #define GPS_RX_GPIO      45
@@ -112,9 +113,11 @@ void app_main(void)
 {
     initialize_gps_uart();
     initialize_pps();
-    ESP_ERROR_CHECK(ethernet_start());
 
-    ESP_LOGI(TAG, "Clock 2 GPS, PPS, and Ethernet hardware test");
+    ESP_ERROR_CHECK(ethernet_start());
+    ESP_ERROR_CHECK(clock2_mdns_start());
+
+    ESP_LOGI(TAG, "Clock 2 GPS, PPS, Ethernet, and mDNS hardware test");
 
     uint8_t buffer[GPS_BUFFER_SIZE + 1];
     uint32_t displayed_pps_count = 0;

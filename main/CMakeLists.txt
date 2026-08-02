@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "ethernet.c"
+        "mdns_service.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -12,5 +13,5 @@ idf_component_register(
         esp_event
         esp_netif
         esp_timer
+        mdns
 )
-
