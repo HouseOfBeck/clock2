@@ -56,33 +56,37 @@ No custom PCB is required.
 
 ## Required GPS Modifications
 
-### Move H1
+Required Modifications to the Pico-GPS-L76B
+The Waveshare Pico-GPS-L76B is designed to be used with multiple host platforms. In its factory configuration, the UART and PPS signals are routed to the default Pico pin assignments.
+Clock 2 uses the Waveshare ESP32-S3-ETH board instead of a Raspberry Pi Pico, so the GPS module must be reconfigured to route those signals to the ESP32-S3 pins used by the firmware.
+These are one-time hardware modifications.
+H1 and H2 – Route the UART
+The Pico-GPS-L76B contains two solder jumpers, H1 and H2, that determine where the GPS receiver's UART is routed.
+From the factory, both jumpers are in the A position.
+Move:
+H1: A → B
+H2: A → B
+This reroutes the GPS receiver's TX and RX signals from the default Pico UART pins to the alternate UART pins connected to the ESP32-S3-ETH expansion header.
+The Clock 2 firmware expects the GPS receiver to appear on these alternate pins. If H1 and H2 remain in the factory position, the ESP32-S3 will not receive any NMEA data.
+Development Note: During development, an intermittent loss of GPS communication was eventually traced to a poor solder joint on H2. If the firmware reports no NMEA sentences despite the GPS appearing to operate normally, verify continuity across H2.
 
-Move jumper **H1** from **A → B**.
-
-[![Clock 2 Hero](docs/images/L76K-before.jpg)](docs/images/L76K-before.jpg)
-
-### Move H2
-
-Move jumper **H2** from **A → B**.
-
-This routes the GPS UART to the pins expected by the firmware.
-
-> Development note: An intermittent GPS failure during development was
-> traced to a poor solder joint on H2. Verify continuity after
-> soldering.
+[![Clock 2 Hero](docs/images/L76K-before-H1H2.jpg)](docs/images/L76K-before-H1H2.jpg)
 
 
 ### Close R20
 
-Close solder bridge **R20** to enable the 1 PPS signal.
+[![Clock 2 Hero](docs/images/L76K-beforeR20.jpg)](docs/images/L76K-before-R20.jpg)
 
-Without R20:
+R20 – Enable the PPS Signal
+The L76K GPS receiver generates an accurate 1 Pulse Per Second (1 PPS) timing signal that is used to discipline the Clock 2 timebase.
+On the Pico-GPS-L76B, this signal is not connected to the expansion header by default.
+Close solder bridge R20 to route the PPS output to the expansion connector.
+Without this modification:
+GPS position data is available.
+NMEA sentences are received normally.
+PPS is unavailable.
+Without PPS, Clock 2 cannot operate as a GPS-disciplined Stratum-1 NTP server. It would function only as an ordinary GPS clock.
 
--   GPS works.
--   NMEA works.
--   PPS does not.
--   Clock 2 cannot operate as a GPS-disciplined Stratum-1 server.
 
 
 ## Hardware Assembly
