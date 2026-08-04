@@ -8,6 +8,7 @@
 #include "gps_uart.h"
 #include "mdns_service.h"
 #include "ntp_server.h"
+#include "oled_display.h"
 #include "pps.h"
 #include "timebase.h"
 #include "web_server.h"
@@ -17,6 +18,7 @@ static const char *TAG = "clock2-gps";
 void app_main(void)
 {
     ESP_ERROR_CHECK(app_config_init());
+    (void)oled_display_init();
     ESP_ERROR_CHECK(gps_uart_start());
     ESP_ERROR_CHECK(pps_start());
     ESP_ERROR_CHECK(ethernet_start());

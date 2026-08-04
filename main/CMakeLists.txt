@@ -8,6 +8,7 @@ idf_component_register(
         "ntp_path_diagnostics.c"
         "ntp_server.c"
         "ntp_time.c"
+        "oled_display.c"
         "pps_diagnostics.c"
         "pps.c"
         "timebase.c"
