@@ -9,6 +9,7 @@
 #include "mdns_service.h"
 #include "ntp_server.h"
 #include "oled_display.h"
+#include "oled_ui.h"
 #include "pps.h"
 #include "timebase.h"
 #include "web_server.h"
@@ -29,6 +30,9 @@ void app_main(void)
     }
     ntp_server_start();
     ESP_ERROR_CHECK(web_server_start());
+    if (oled_display_is_available()) {
+        (void)oled_ui_start();
+    }
 
     ESP_LOGI(TAG, "Clock 2 GPS-disciplined NTP and status server");
 

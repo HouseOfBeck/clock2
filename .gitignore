@@ -1,4 +1,4 @@
-# ESP-IDF generated files
+# ESP-IDF build output
 build/
 sdkconfig.old
 
@@ -7,3 +7,17 @@ sdkconfig.old
 
 # ESP-IDF managed dependencies
 managed_components/
+
+# Python
+venv/
+.venv/
+__pycache__/
+
+# VS Code
+.vscode/
+
+# CLion
+.idea/
+
+# Python test cache
+.pytest_cache/

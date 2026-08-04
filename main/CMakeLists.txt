@@ -9,6 +9,8 @@ idf_component_register(
         "ntp_server.c"
         "ntp_time.c"
         "oled_display.c"
+        "oled_ui.c"
+        "oled_ui_logic.c"
         "pps_diagnostics.c"
         "pps.c"
         "timebase.c"
