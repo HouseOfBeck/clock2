@@ -60,7 +60,7 @@ No custom PCB is required.
 
 Move jumper **H1** from **A → B**.
 
-**PHOTO PLACEHOLDER:** H1
+[![Clock 2 Hero](docs/images/L76K-before.jpg)](docs/images/L76K-before.jpg)
 
 ### Move H2
 
@@ -72,7 +72,6 @@ This routes the GPS UART to the pins expected by the firmware.
 > traced to a poor solder joint on H2. Verify continuity after
 > soldering.
 
-**PHOTO PLACEHOLDER:** H2
 
 ### Close R20
 
@@ -85,7 +84,6 @@ Without R20:
 -   PPS does not.
 -   Clock 2 cannot operate as a GPS-disciplined Stratum-1 server.
 
-**PHOTO PLACEHOLDER:** R20
 
 ## Hardware Assembly
 
